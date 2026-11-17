@@ -24,26 +24,21 @@
  *
  * Display order is the order a student meets activities on the course page:
  * 1. Walk non-delegated sections in get_section_info_all() order.
- * 2. Within a section, follow get_sections() (section number => cmids in
- *    sequence). That is the modinfo cache, not a fresh database query.
- * 3. Those top-level modules are recorded before any delegated section is
- *    entered. A subsection lookup only inserts children after the owning
- *    module. If that lookup fails, the top-level modules stay where they are.
- * 4. When a module owns a delegated section and has a URL, the module is kept
- *    and the subsection modules follow it, including nested subsections.
- *    A module with no URL is not itself a target; its subsection modules are
- *    still inserted at that point.
- * 5. Delegated sections that were not reached from a parent module are appended
- *    in get_section_info_all() order so an orphaned subsection is not dropped.
- *
- * The current activity is always kept in that list, even when it would not be
- * a link target. Neighbours are chosen from the list afterwards. They are not
- * discovered by the delegated-section walk.
+ * 2. Within a section, read cm ids from get_sections() using the section
+ *    number ($section->section), not the section id ($cm->section). That is
+ *    the modinfo cache. If the number key is missing and the section id is a
+ *    key that is not itself a section number, use that list.
+ * 3. A delegated subsection is inlined after its owning cm via
+ *    get_sections_delegated_by_cm(). The owning cm stays in the list.
+ * 4. Delegated sections that were not reached from a parent are appended.
+ * 5. Any non-deleted cm still missing from get_cms() is inserted, and the
+ *    current cm is inserted if it is still absent. The current cm stays in
+ *    the list even when it is not a link target.
  *
  * Visibility. A link target must be uservisible. Modinfo already applies
  * availability, group, and hidden-section rules for the current user, including
  * guests and users without access. Activities with deletioninprogress are not
- * targets. The current activity stays in the list even when it would not
+ * targets. The current activity is kept as an anchor even when it would not
  * itself be a target, so the nearest earlier and later targets can still be found.
  *
  * Custom URL versus automatic. A non-empty custom URL replaces automatic
@@ -86,14 +81,66 @@ class navigation {
     /** @var string Classes used when the setting is empty or not a class list. */
     public const DEFAULT_BUTTON_CLASS = 'btn btn-outline-primary';
 
+    /**
+     * Code version printed in the on-page diagnostic.
+     * Keep in step with $plugin->version in version.php.
+     */
+    public const VERSION = 2026111703;
+
     /** @var int Longest accepted custom URL. */
     private const MAX_URL_LENGTH = 2000;
+
+    /** @var array<int, int[]>|null get_sections() keyed by an integer section number or id. */
+    private ?array $groupedsections = null;
+
+    /** @var array<int, bool>|null Section numbers in this course. */
+    private ?array $sectionnumbers = null;
+
+    /** @var string[] Raw get_sections() keys, for the diagnostic. */
+    private array $rawsectionkeys = [];
+
+    /** @var int Sections whose cm list was read with the section number. */
+    private int $sectionnumberhits = 0;
+
+    /** @var int Sections whose cm list was read with the section id. */
+    private int $sectionidfallbacks = 0;
+
+    /** @var int[] Section numbers that had no cm list under either key. */
+    private array $unmatchedsections = [];
+
+    /** @var int[] Section numbers walked, in walk order. */
+    private array $walkednumbers = [];
+
+    /** @var int Delegated sections in the course. */
+    private int $delegatedsectioncount = 0;
+
+    /** @var int Times a delegated section was inlined after its owner. */
+    private int $delegatedinlined = 0;
+
+    /** @var string How the delegated-section map was built. */
+    private string $delegatednote = '';
+
+    /** @var int[] Cm ids added because the section walk missed them. */
+    private array $recoveredcmids = [];
+
+    /** @var bool True when the current cm was inserted after the section walk. */
+    private bool $insertedcurrent = false;
+
+    /** @var bool True when the section walk already contained the current cm. */
+    private bool $currentinwalk = false;
+
+    /** @var bool True when the finished sequence contains the current cm. */
+    private bool $currentfound = false;
+
+    /** @var int|null Index of the current cm in the finished sequence. */
+    private ?int $currentindex = null;
 
     /**
      * Build the template data for this page, or null when nothing should render.
      *
      * Uses one get_fast_modinfo() call. Returns null when the master switch is
-     * off, the page is not an activity view, or every button is omitted.
+     * off, the page is not an activity view, or every button is omitted and the
+     * diagnostic is hidden.
      *
      * @return stdClass|null
      */
@@ -121,30 +168,41 @@ class navigation {
             return null;
         }
 
+        $this->reset_trace();
         $sequence = $this->display_sequence($modinfo);
         [$previouscm, $nextcm] = $this->neighbours($sequence);
 
         $classes = $this->button_classes();
         $newtab = $this->config_flag('newtab', false);
-        $previous = $this->direction_button('previous', $previouscm, $classes, $newtab);
-        $next = $this->direction_button('next', $nextcm, $classes, $newtab);
+        $previous = $this->resolve_direction('previous', $previouscm, $classes, $newtab, $sequence);
+        $next = $this->resolve_direction('next', $nextcm, $classes, $newtab, $sequence);
         $back = $this->back_to_course_button($course, $classes, $newtab);
 
-        if ($previous === null && $next === null && $back === null) {
+        $debugon = $this->config_flag('debug', true);
+        $missingdirection = $previous['button'] === null || $next['button'] === null;
+        $debugtext = null;
+        if ($debugon || $missingdirection) {
+            $debugtext = $this->debug_text($modinfo, $sequence, $previous['summary'], $next['summary']);
+        }
+
+        if ($previous['button'] === null && $next['button'] === null && $back === null && $debugtext === null) {
             return null;
         }
 
         $data = (object)[
             'navigationlabel' => get_string('navigation', self::COMPONENT),
         ];
-        if ($previous !== null) {
-            $data->previous = $previous;
+        if ($previous['button'] !== null) {
+            $data->previous = $previous['button'];
         }
-        if ($next !== null) {
-            $data->next = $next;
+        if ($next['button'] !== null) {
+            $data->next = $next['button'];
         }
         if ($back !== null) {
             $data->backtocourse = $back;
+        }
+        if ($debugtext !== null) {
+            $data->debugtext = $debugtext;
         }
         return $data;
     }
@@ -273,12 +331,9 @@ class navigation {
     /**
      * Course modules in on-screen order.
      *
-     * Non-delegated sections are copied from get_sections() before any
-     * subsection is entered. The current activity is kept even when it is not
-     * a link target, so neighbours() can look on either side of it. A
-     * delegated-section lookup only inserts children after the owning module.
-     * It is not how the current module or its neighbours are found: if the
-     * lookup fails, the top-level modules are already in the list.
+     * The list includes modules that are not link targets so the current
+     * activity can still be located. Deletion-in-progress modules are left out
+     * except the current one, which remains an anchor.
      *
      * @param course_modinfo $modinfo Course module cache for the current user.
      * @return cm_info[]
@@ -288,406 +343,350 @@ class navigation {
 
         $sequence = [];
         $seen = [];
-        $inlined = [];
+        $visitedsections = [];
         $currentid = (int)$PAGE->cm->id;
-        $cms = $modinfo->get_cms();
-        $bysection = $modinfo->get_sections();
-        // Indexed by course-module id. Empty when the lookup itself fails, so
-        // a broken subsection delegate cannot remove the activities around it.
         $delegatedbycm = $this->delegated_sections_by_cm($modinfo);
+        $sections = $modinfo->get_section_info_all();
 
-        foreach ($modinfo->get_section_info_all() as $sectionnum => $section) {
-            if ($this->section_is_delegated($section)) {
-                continue;
-            }
-            $sectionnum = $this->resolved_section_number((int)$sectionnum, $section, $bysection);
-            try {
-                $this->append_section_modules(
-                    $sectionnum,
-                    $currentid,
-                    $cms,
-                    $bysection,
-                    $delegatedbycm,
-                    $sequence,
-                    $seen,
-                    $inlined
-                );
-            } catch (\Throwable) {
-                // Modules already copied stay. Later sections are still walked.
-            }
-        }
-        foreach ($modinfo->get_section_info_all() as $sectionnum => $section) {
-            if (!$this->section_is_delegated($section)) {
-                continue;
-            }
-            $sectionnum = $this->resolved_section_number((int)$sectionnum, $section, $bysection);
-            if (isset($inlined[$sectionnum])) {
-                continue;
-            }
-            try {
-                $this->append_section_modules(
-                    $sectionnum,
-                    $currentid,
-                    $cms,
-                    $bysection,
-                    $delegatedbycm,
-                    $sequence,
-                    $seen,
-                    $inlined
-                );
-            } catch (\Throwable) {
-                // Orphan subsections are optional. Top-level modules are already recorded.
+        $this->delegatedsectioncount = 0;
+        foreach ($sections as $section) {
+            if ($section->is_delegated()) {
+                $this->delegatedsectioncount++;
             }
         }
 
-        $this->ensure_current_anchor($currentid, $cms, $bysection, $sequence, $seen);
+        foreach ($sections as $section) {
+            if ($section->is_delegated()) {
+                continue;
+            }
+            $this->append_section($modinfo, $section, $currentid, $sequence, $seen, $visitedsections, $delegatedbycm);
+        }
+        foreach ($sections as $section) {
+            if (!$section->is_delegated() || isset($visitedsections[(int)$section->section])) {
+                continue;
+            }
+            $this->append_section($modinfo, $section, $currentid, $sequence, $seen, $visitedsections, $delegatedbycm);
+        }
+
+        $this->currentinwalk = isset($seen[$currentid]);
+        $this->recover_missing_cms($modinfo, $currentid, $sequence, $seen);
+        $this->ensure_current_cm($modinfo, $currentid, $sequence, $seen);
+
         return $sequence;
     }
 
     /**
-     * Append one section's modules.
+     * Append one section's modules, then inline a delegated subsection after its owner.
      *
-     * Top-level modules are appended before the method follows a delegated
-     * subsection, so a failed follow-up cannot drop them. A module that owns a
-     * subsection is included when it has a URL (or when it is the current
-     * activity); its subsection modules come next.
+     * The owner is added before its subsection. Cm ids come from get_sections()
+     * using the section number. A missing number key can fall back to the
+     * section id when that id is not also a section number.
      *
-     * @param int $sectionnum Section number (not the section id).
+     * @param course_modinfo $modinfo Course module cache.
+     * @param section_info $section Section to walk.
      * @param int $currentid Current course-module id.
-     * @param cm_info[] $cms Course modules keyed by id.
-     * @param array<int, int[]> $bysection Section number => cmids in sequence order.
-     * @param array<int, section_info> $delegatedbycm Delegated sections keyed by owning cmid.
      * @param cm_info[] $sequence Collected modules.
-     * @param array<int, bool> $seen Course-module ids already considered.
-     * @param array<int, bool> $inlined Section numbers already walked.
+     * @param array<int, bool> $seen Course-module ids already collected.
+     * @param array<int, bool> $visitedsections Section numbers already walked.
+     * @param array<int, section_info> $delegatedbycm Delegated section by owning cmid.
      * @return void
      */
-    private function append_section_modules(
-        int $sectionnum,
+    private function append_section(
+        course_modinfo $modinfo,
+        section_info $section,
         int $currentid,
-        array $cms,
-        array $bysection,
-        array $delegatedbycm,
         array &$sequence,
         array &$seen,
-        array &$inlined
+        array &$visitedsections,
+        array $delegatedbycm
     ): void {
-        if (isset($inlined[$sectionnum])) {
+        $sectionnum = (int)$section->section;
+        if (isset($visitedsections[$sectionnum])) {
             return;
         }
-        $inlined[$sectionnum] = true;
+        $visitedsections[$sectionnum] = true;
+        $this->walkednumbers[] = $sectionnum;
 
-        $cmids = $this->section_cmids($bysection, $sectionnum);
-        foreach ($cmids as $cmid) {
+        $cms = $modinfo->get_cms();
+        foreach ($this->section_cmids($modinfo, $section) as $cmid) {
             if (isset($seen[$cmid]) || !isset($cms[$cmid])) {
                 continue;
             }
-            $cm = $cms[$cmid];
-            $owned = $this->owned_delegated_section($delegatedbycm, $cmid);
             $seen[$cmid] = true;
-            if ($this->keep_module($cm, $cmid === $currentid, $owned)) {
+            $cm = $cms[$cmid];
+
+            // Keep the owner. A delegated subsection is appended after it.
+            if (empty($cm->deletioninprogress) || $cmid === $currentid) {
                 $sequence[] = $cm;
             }
-            if (!$owned instanceof section_info) {
-                continue;
-            }
-            $childnum = $this->section_number($owned);
-            if ($childnum === null || isset($inlined[$childnum])) {
-                continue;
-            }
-            try {
-                $this->append_section_modules(
-                    $childnum,
+
+            if (isset($delegatedbycm[$cmid]) && $delegatedbycm[$cmid] instanceof section_info) {
+                $this->delegatedinlined++;
+                $this->append_section(
+                    $modinfo,
+                    $delegatedbycm[$cmid],
                     $currentid,
-                    $cms,
-                    $bysection,
-                    $delegatedbycm,
                     $sequence,
                     $seen,
-                    $inlined
+                    $visitedsections,
+                    $delegatedbycm
                 );
-            } catch (\Throwable) {
-                // The parent modules are already recorded. Leave this section
-                // unmarked so the orphan pass can still append its modules.
-                unset($inlined[$childnum]);
             }
         }
     }
 
     /**
-     * Course-module ids for a section number, in sequence order.
+     * Cm ids for one section, from get_sections(), keyed by section number.
      *
-     * get_sections() is keyed by section number. A numeric string key is the
-     * same entry. An empty result is an empty section, not a reason to drop
-     * other sections.
+     * $section->section is the section number. $cm->section is the section id.
+     * Moodle's modinfo cache keys get_sections() by section number. A build that
+     * keys the same map by section id is used only when the number is absent and
+     * the id is not itself some section's number, so a real section-number list
+     * is never replaced by another section's modules.
      *
-     * @param array<int, int[]> $bysection Section number => cmids.
-     * @param int $sectionnum Section number.
+     * @param course_modinfo $modinfo Course module cache.
+     * @param section_info $section Section being walked.
      * @return int[]
      */
-    private function section_cmids(array $bysection, int $sectionnum): array {
-        $cmids = $bysection[$sectionnum] ?? [];
-        if (!is_array($cmids)) {
-            return [];
+    private function section_cmids(course_modinfo $modinfo, section_info $section): array {
+        $grouped = $this->grouped_sections($modinfo);
+        $number = (int)$section->section;
+        if (array_key_exists($number, $grouped)) {
+            $this->sectionnumberhits++;
+            return $this->normalise_cmids($grouped[$number]);
         }
+
+        $id = (int)$section->id;
+        $numbers = $this->section_numbers($modinfo);
+        if ($id > 0 && !isset($numbers[$id]) && array_key_exists($id, $grouped)) {
+            $this->sectionidfallbacks++;
+            return $this->normalise_cmids($grouped[$id]);
+        }
+
+        $this->unmatchedsections[] = $number;
+        return [];
+    }
+
+    /**
+     * get_sections() with integer keys.
+     *
+     * Numeric string keys are cast to int, which is how PHP stores them.
+     *
+     * @param course_modinfo $modinfo Course module cache.
+     * @return array<int, array>
+     */
+    private function grouped_sections(course_modinfo $modinfo): array {
+        if ($this->groupedsections !== null) {
+            return $this->groupedsections;
+        }
+
+        $raw = $modinfo->get_sections();
+        $grouped = [];
+        $this->rawsectionkeys = [];
+        if (is_array($raw)) {
+            foreach ($raw as $key => $cmids) {
+                $this->rawsectionkeys[] = (string)$key;
+                $keytext = (string)$key;
+                if ($keytext !== '' && ctype_digit($keytext)) {
+                    $grouped[(int)$keytext] = is_array($cmids) ? $cmids : [];
+                }
+            }
+        }
+        $this->groupedsections = $grouped;
+        return $grouped;
+    }
+
+    /**
+     * Section numbers present on the course.
+     *
+     * @param course_modinfo $modinfo Course module cache.
+     * @return array<int, bool>
+     */
+    private function section_numbers(course_modinfo $modinfo): array {
+        if ($this->sectionnumbers !== null) {
+            return $this->sectionnumbers;
+        }
+        $numbers = [];
+        foreach ($modinfo->get_section_info_all() as $section) {
+            $numbers[(int)$section->section] = true;
+        }
+        $this->sectionnumbers = $numbers;
+        return $numbers;
+    }
+
+    /**
+     * Keep numeric course-module ids.
+     *
+     * @param array $cmids Values from one get_sections() entry.
+     * @return int[]
+     */
+    private function normalise_cmids(array $cmids): array {
         $ids = [];
         foreach ($cmids as $cmid) {
-            $ids[] = (int)$cmid;
+            if (is_int($cmid) || (is_string($cmid) && ctype_digit($cmid))) {
+                $ids[] = (int)$cmid;
+            }
         }
         return $ids;
     }
 
     /**
-     * Whether this section is delegated to a component.
+     * Delegated section for each owning course module.
      *
-     * A failure here is treated as not delegated, so the section's own modules
-     * stay in the top-level pass instead of being skipped.
-     *
-     * @param section_info $section Section from get_section_info_all().
-     * @return bool
-     */
-    private function section_is_delegated(section_info $section): bool {
-        if (!method_exists($section, 'is_delegated')) {
-            return false;
-        }
-        try {
-            return (bool)$section->is_delegated();
-        } catch (\Throwable) {
-            return false;
-        }
-    }
-
-    /**
-     * Delegated sections keyed by the course-module that owns them.
-     *
-     * This is get_sections_delegated_by_cm(), keyed by course-module id.
-     * Looking up get_section_info_by_component('mod_' . modname, instance) for
-     * every module, then walking that section with the same visited-section
-     * guard as top-level sections, could mark a section visited and skip its
-     * modules. An empty map only skips inlining. Top-level modules are already
-     * recorded by the caller.
+     * get_sections_delegated_by_cm() is the modinfo map (cm id => section).
+     * The component-and-instance lookup is only used when that method is missing
+     * or throws, so a normal activity is not treated as the owner of a section.
      *
      * @param course_modinfo $modinfo Course module cache.
      * @return array<int, section_info>
      */
     private function delegated_sections_by_cm(course_modinfo $modinfo): array {
-        if (!method_exists($modinfo, 'get_sections_delegated_by_cm')) {
-            return [];
+        if (method_exists($modinfo, 'get_sections_delegated_by_cm')) {
+            try {
+                $map = $modinfo->get_sections_delegated_by_cm();
+                if (is_array($map)) {
+                    $bycm = [];
+                    foreach ($map as $cmid => $section) {
+                        if ($section instanceof section_info) {
+                            $bycm[(int)$cmid] = $section;
+                        }
+                    }
+                    $this->delegatednote = 'get_sections_delegated_by_cm (' . count($bycm) . ' owners)';
+                    return $bycm;
+                }
+                $this->delegatednote = 'get_sections_delegated_by_cm returned no map';
+            } catch (\Throwable $e) {
+                $this->delegatednote = 'get_sections_delegated_by_cm failed: ' .
+                    $this->one_line($e->getMessage(), 160);
+            }
+        } else {
+            $this->delegatednote = 'get_sections_delegated_by_cm missing';
         }
-        try {
-            $map = $modinfo->get_sections_delegated_by_cm();
-        } catch (\Throwable) {
-            return [];
-        }
-        return is_array($map) ? $map : [];
+
+        return $this->delegated_sections_by_component($modinfo);
     }
 
     /**
-     * Delegated section owned by this course module, if any.
+     * Owning cm to delegated section, matched by component and instance.
      *
-     * @param array<int, section_info> $delegatedbycm Map from delegated_sections_by_cm().
-     * @param int $cmid Course-module id.
-     * @return section_info|null
+     * @param course_modinfo $modinfo Course module cache.
+     * @return array<int, section_info>
      */
-    private function owned_delegated_section(array $delegatedbycm, int $cmid): ?section_info {
-        if (!isset($delegatedbycm[$cmid]) || !$delegatedbycm[$cmid] instanceof section_info) {
-            return null;
+    private function delegated_sections_by_component(course_modinfo $modinfo): array {
+        $bycm = [];
+        foreach ($modinfo->get_cms() as $cm) {
+            try {
+                $delegated = $modinfo->get_section_info_by_component(
+                    'mod_' . $cm->modname,
+                    (int)$cm->instance
+                );
+            } catch (\Throwable $e) {
+                continue;
+            }
+            if ($delegated instanceof section_info) {
+                $bycm[(int)$cm->id] = $delegated;
+            }
         }
-        $section = $delegatedbycm[$cmid];
-        if (!$this->section_is_delegated($section)) {
-            return null;
+        $suffix = 'component lookup (' . count($bycm) . ' owners)';
+        if ($this->delegatednote === '') {
+            $this->delegatednote = $suffix;
+        } else {
+            $this->delegatednote .= '; ' . $suffix;
         }
-        return $section;
+        return $bycm;
     }
 
     /**
-     * Section number to use with get_sections().
+     * Insert non-deleted course modules the section walk did not collect.
      *
-     * get_section_info_all() is keyed by section number. When that key has no
-     * modules and the section's own number does, the property is used. An
-     * empty section stays empty; other sections are unaffected.
+     * get_cms() is the full modinfo list. A section-key miss must not drop those
+     * modules, or the current activity has no neighbours.
      *
-     * @param int $key Key from get_section_info_all().
-     * @param section_info $section Section at that key.
-     * @param array<int, int[]> $bysection Section number => cmids.
-     * @return int
-     */
-    private function resolved_section_number(int $key, section_info $section, array $bysection): int {
-        if ($this->section_cmids($bysection, $key) !== []) {
-            return $key;
-        }
-        $fromproperty = $this->section_number($section);
-        if ($fromproperty !== null && $fromproperty !== $key && $this->section_cmids($bysection, $fromproperty) !== []) {
-            return $fromproperty;
-        }
-        return $key;
-    }
-
-    /**
-     * Section number for a section_info, or null when it cannot be read.
-     *
-     * @param section_info $section Section to read.
-     * @return int|null
-     */
-    private function section_number(section_info $section): ?int {
-        try {
-            return (int)$section->section;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Whether this module belongs in the display sequence.
-     *
-     * The current activity is always kept, including when it is not uservisible
-     * or has no URL, so it can anchor the previous and next search. Other
-     * modules being deleted are left out. A module that owns a subsection is
-     * kept when it has a URL; without one it is only a container, and the
-     * subsection modules are still added by the caller.
-     *
-     * @param cm_info $cm Candidate module.
-     * @param bool $iscurrent True when this is the activity being viewed.
-     * @param section_info|null $owned Delegated section owned by this module.
-     * @return bool
-     */
-    private function keep_module(cm_info $cm, bool $iscurrent, ?section_info $owned): bool {
-        if ($iscurrent) {
-            return true;
-        }
-        if (!empty($cm->deletioninprogress)) {
-            return false;
-        }
-        if ($owned instanceof section_info && !$this->has_link_url($cm)) {
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * Whether the module has a view URL a button could open.
-     *
-     * This is not the full navigable check. Availability and the skip setting
-     * are applied later, when a neighbour is chosen.
-     *
-     * @param cm_info $cm Candidate module.
-     * @return bool
-     */
-    private function has_link_url(cm_info $cm): bool {
-        try {
-            return $cm->url instanceof moodle_url;
-        } catch (\Throwable) {
-            return false;
-        }
-    }
-
-    /**
-     * Put the current activity into the sequence when the section walk missed it.
-     *
-     * get_sections() is the course order for modules the cache lists. The
-     * activity open in the browser can be absent from that list, or it can
-     * fail every link-target check, and the previous and next modules are
-     * still on either side. Neighbour search needs this anchor. Placement
-     * follows the section sequence when the cmid is there, otherwise the
-     * section number.
-     *
+     * @param course_modinfo $modinfo Course module cache.
      * @param int $currentid Current course-module id.
-     * @param cm_info[] $cms Course modules keyed by id.
-     * @param array<int, int[]> $bysection Section number => cmids.
      * @param cm_info[] $sequence Collected modules.
-     * @param array<int, bool> $seen Course-module ids already considered.
+     * @param array<int, bool> $seen Course-module ids already collected.
      * @return void
      */
-    private function ensure_current_anchor(
+    private function recover_missing_cms(
+        course_modinfo $modinfo,
         int $currentid,
-        array $cms,
-        array $bysection,
         array &$sequence,
         array &$seen
     ): void {
-        // Seen is not enough: a container module can be considered and left out
-        // of the list. The anchor is the current id actually present in it.
-        if ($this->sequence_index($sequence, $currentid) !== null) {
-            $seen[$currentid] = true;
+        foreach ($modinfo->get_cms() as $cm) {
+            $cmid = (int)$cm->id;
+            if (isset($seen[$cmid])) {
+                continue;
+            }
+            if (!empty($cm->deletioninprogress) && $cmid !== $currentid) {
+                continue;
+            }
+            $this->insert_cm($sequence, $cm);
+            $seen[$cmid] = true;
+            $this->recoveredcmids[] = $cmid;
+        }
+    }
+
+    /**
+     * Insert the current course module when it is still absent.
+     *
+     * @param course_modinfo $modinfo Course module cache.
+     * @param int $currentid Current course-module id.
+     * @param cm_info[] $sequence Collected modules.
+     * @param array<int, bool> $seen Course-module ids already collected.
+     * @return void
+     */
+    private function ensure_current_cm(
+        course_modinfo $modinfo,
+        int $currentid,
+        array &$sequence,
+        array &$seen
+    ): void {
+        if (isset($seen[$currentid])) {
             return;
         }
-        $cm = $cms[$currentid] ?? null;
+        global $PAGE;
+
+        $cm = null;
+        if (isset($modinfo->get_cms()[$currentid])) {
+            $cm = $modinfo->get_cms()[$currentid];
+        } else if ($PAGE->cm instanceof cm_info && (int)$PAGE->cm->id === $currentid) {
+            $cm = $PAGE->cm;
+        }
         if (!$cm instanceof cm_info) {
-            global $PAGE;
-            if (($PAGE->cm instanceof cm_info) && (int)$PAGE->cm->id === $currentid) {
-                $cm = $PAGE->cm;
-            } else {
-                return;
-            }
+            return;
         }
-
-        $sectionnum = null;
-        try {
-            $sectionnum = (int)$cm->sectionnum;
-        } catch (\Throwable) {
-            $sectionnum = null;
-        }
-
-        $insertat = $this->anchor_index($sequence, $bysection, $currentid, $sectionnum);
-        array_splice($sequence, $insertat, 0, [$cm]);
+        $this->insert_cm($sequence, $cm);
         $seen[$currentid] = true;
+        $this->insertedcurrent = true;
     }
 
     /**
-     * Index at which the current activity should be inserted.
-     *
-     * @param cm_info[] $sequence Modules already collected.
-     * @param array<int, int[]> $bysection Section number => cmids.
-     * @param int $currentid Current course-module id.
-     * @param int|null $sectionnum Section number of the current activity.
-     * @return int
-     */
-    private function anchor_index(array $sequence, array $bysection, int $currentid, ?int $sectionnum): int {
-        if ($sectionnum !== null) {
-            $cmids = $this->section_cmids($bysection, $sectionnum);
-            $pos = array_search($currentid, $cmids, true);
-            if ($pos !== false) {
-                for ($i = $pos - 1; $i >= 0; $i--) {
-                    $idx = $this->sequence_index($sequence, $cmids[$i]);
-                    if ($idx !== null) {
-                        return $idx + 1;
-                    }
-                }
-                for ($i = $pos + 1, $count = count($cmids); $i < $count; $i++) {
-                    $idx = $this->sequence_index($sequence, $cmids[$i]);
-                    if ($idx !== null) {
-                        return $idx;
-                    }
-                }
-            }
-            foreach ($sequence as $i => $existing) {
-                try {
-                    $existingnum = (int)$existing->sectionnum;
-                } catch (\Throwable) {
-                    continue;
-                }
-                if ($existingnum > $sectionnum) {
-                    return $i;
-                }
-            }
-        }
-        return count($sequence);
-    }
-
-    /**
-     * Position of a course module in the sequence, or null when it is absent.
+     * Place a course module with others that share its section number.
      *
      * @param cm_info[] $sequence Collected modules.
-     * @param int $cmid Course-module id.
-     * @return int|null
+     * @param cm_info $cm Module to insert.
+     * @return void
      */
-    private function sequence_index(array $sequence, int $cmid): ?int {
+    private function insert_cm(array &$sequence, cm_info $cm): void {
+        $sectionnum = (int)$cm->sectionnum;
+        $at = count($sequence);
+        $lastsame = null;
         foreach ($sequence as $i => $existing) {
-            if ((int)$existing->id === $cmid) {
-                return $i;
+            $existingnum = (int)$existing->sectionnum;
+            if ($existingnum === $sectionnum) {
+                $lastsame = $i;
+                continue;
+            }
+            if ($lastsame === null && $existingnum > $sectionnum && $at === count($sequence)) {
+                $at = $i;
             }
         }
-        return null;
+        if ($lastsame !== null) {
+            $at = $lastsame + 1;
+        }
+        array_splice($sequence, $at, 0, [$cm]);
     }
 
     /**
@@ -707,6 +706,8 @@ class navigation {
                 break;
             }
         }
+        $this->currentfound = $index !== null;
+        $this->currentindex = $index;
         if ($index === null) {
             return [null, null];
         }
@@ -749,63 +750,170 @@ class navigation {
      * @return bool
      */
     private function is_navigable(cm_info $cm, bool $skipnonnavigable): bool {
-        if (!$cm->uservisible || !empty($cm->deletioninprogress)) {
-            return false;
-        }
-        $url = $cm->url;
-        if (!$url instanceof moodle_url) {
-            return false;
-        }
-        if (!$skipnonnavigable) {
-            return true;
-        }
-        if ($cm->modname === 'label' || !$cm->has_view()) {
-            return false;
-        }
-        if (plugin_supports('mod', $cm->modname, FEATURE_NO_VIEW_LINK)) {
-            return false;
-        }
-        return true;
+        return $this->navigable_block($cm, $skipnonnavigable) === null;
     }
 
     /**
-     * Previous or next button, from a custom URL or from the neighbour module.
+     * Why a module cannot be an automatic previous or next target.
      *
-     * Config keys are show{direction}, {direction}label, and {direction}url.
+     * Null means the module can be linked. The returned phrase is one of
+     * "not uservisible", "no url", "skipped non-navigable", or
+     * "deletion in progress". "no url" may include the value's type.
      *
-     * @param string $direction previous or next. Also the language-string key for the default label.
+     * @param cm_info $cm Candidate module.
+     * @param bool $skipnonnavigable Setting value.
+     * @return string|null
+     */
+    private function navigable_block(cm_info $cm, bool $skipnonnavigable): ?string {
+        if (!empty($cm->deletioninprogress)) {
+            return 'deletion in progress';
+        }
+        if (!$cm->uservisible) {
+            return 'not uservisible';
+        }
+        if ($this->activity_url($cm) === null) {
+            return 'no url' . $this->url_type_suffix($cm);
+        }
+        if ($skipnonnavigable && $this->is_nonnavigable_type($cm)) {
+            return 'skipped non-navigable';
+        }
+        return null;
+    }
+
+    /**
+     * Whether skip-non-navigable should pass over this module even though it has a URL.
+     *
+     * @param cm_info $cm Candidate module.
+     * @return bool
+     */
+    private function is_nonnavigable_type(cm_info $cm): bool {
+        if ($cm->modname === 'label') {
+            return true;
+        }
+        if (method_exists($cm, 'has_view') && !$cm->has_view()) {
+            return true;
+        }
+        return (bool)plugin_supports('mod', $cm->modname, FEATURE_NO_VIEW_LINK);
+    }
+
+    /**
+     * Link for a course module, including a URL object that is not moodle_url.
+     *
+     * Moodle 4.5 stores a moodle_url. Later releases alias that class. An object
+     * with out() is still a link; treating it as "no url" hid every neighbour.
+     *
+     * @param cm_info $cm Candidate module.
+     * @return moodle_url|null
+     */
+    private function activity_url(cm_info $cm): ?moodle_url {
+        $url = $cm->url;
+        if ($url instanceof moodle_url) {
+            return $url;
+        }
+        if (!is_object($url) || !method_exists($url, 'out')) {
+            return null;
+        }
+        try {
+            $text = $url->out(false);
+        } catch (moodle_exception) {
+            return null;
+        }
+        if (!is_string($text) || $text === '') {
+            return null;
+        }
+        try {
+            return new moodle_url($text);
+        } catch (moodle_exception) {
+            return null;
+        }
+    }
+
+    /**
+     * Extra text after "no url" when the value is present but not a link.
+     *
+     * @param cm_info $cm Candidate module.
+     * @return string
+     */
+    private function url_type_suffix(cm_info $cm): string {
+        $url = $cm->url;
+        if ($url === null || $url === '' || $url === false) {
+            return '';
+        }
+        if (is_object($url)) {
+            return ' (' . get_class($url) . ')';
+        }
+        return ' (' . gettype($url) . ')';
+    }
+
+    /**
+     * Previous or next button, and the diagnostic line for that direction.
+     *
+     * The show checkbox is honoured: a saved value other than "1" hides the
+     * button. A non-empty custom URL that fails validation hides the button
+     * and does not fall back to the neighbour. The summary still names the
+     * neighbour or the omit reason.
+     *
+     * @param string $direction previous or next.
      * @param cm_info|null $target Automatic neighbour, when one exists.
      * @param string $classes Button classes.
      * @param bool $newtab Whether the link opens in a new tab.
-     * @return stdClass|null
+     * @param cm_info[] $sequence Display-order modules.
+     * @return array{button: stdClass|null, summary: string}
      */
-    private function direction_button(
+    private function resolve_direction(
         string $direction,
         ?cm_info $target,
         string $classes,
-        bool $newtab
-    ): ?stdClass {
+        bool $newtab,
+        array $sequence
+    ): array {
+        $way = $direction === 'previous' ? -1 : 1;
+        $automatic = $this->automatic_summary($target, $sequence, $way);
+
         if (!$this->config_flag('show' . $direction, true)) {
-            return null;
+            $raw = get_config(self::COMPONENT, 'show' . $direction);
+            $saved = $raw === false ? 'not saved' : 'saved "' . $this->one_line(trim((string)$raw), 40) . '"';
+            return [
+                'button' => null,
+                'summary' => $direction . ': omitted: show checkbox off (' . $saved . '); ' . $automatic,
+            ];
         }
 
         $custom = $this->config_text($direction . 'url');
         if ($custom !== '') {
             $url = self::clean_link($custom);
             if ($url === null) {
-                return null;
+                return [
+                    'button' => null,
+                    'summary' => $direction . ': omitted: invalid custom URL; ' . $automatic,
+                ];
             }
-            return $this->make_button($direction, $direction . 'label', $url, null, false, $classes, $newtab);
+            return [
+                'button' => $this->make_button($direction, $direction . 'label', $url, null, false, $classes, $newtab),
+                'summary' => $direction . ': custom URL; ' . $automatic,
+            ];
         }
 
-        if ($target === null || !$target->url instanceof moodle_url) {
-            return null;
+        $activityurl = $target === null ? null : $this->activity_url($target);
+        if ($target === null || $activityurl === null) {
+            $reason = $target === null
+                ? $this->omit_reason($sequence, $this->currentindex, $way)
+                : 'no url' . ($target === null ? '' : $this->url_type_suffix($target));
+            return [
+                'button' => null,
+                'summary' => $direction . ': omitted: ' . $reason,
+            ];
         }
 
         // forceview keeps resources that would otherwise redirect to the course
         // on their own view page, which is where this bar is rendered.
-        $url = new moodle_url($target->url, ['forceview' => 1]);
-        return $this->make_button($direction, $direction . 'label', $url, $target, true, $classes, $newtab);
+        $url = new moodle_url($activityurl, ['forceview' => 1]);
+        $skipped = $this->skipped_notes($sequence, $this->currentindex, $way, $target);
+        $extra = $skipped === '' ? '' : '; ' . $skipped;
+        return [
+            'button' => $this->make_button($direction, $direction . 'label', $url, $target, true, $classes, $newtab),
+            'summary' => $direction . ': cmid ' . (int)$target->id . ' modname ' . $target->modname . $extra,
+        ];
     }
 
     /**
@@ -957,7 +1065,7 @@ class navigation {
         if ($value === false) {
             return $default;
         }
-        return (string)$value === '1';
+        return trim((string)$value) === '1';
     }
 
     /**
@@ -972,5 +1080,377 @@ class navigation {
             return '';
         }
         return trim(clean_param((string)$value, PARAM_RAW_TRIMMED));
+    }
+
+    /**
+     * Clear sequence facts from an earlier build on this object.
+     *
+     * @return void
+     */
+    private function reset_trace(): void {
+        $this->groupedsections = null;
+        $this->sectionnumbers = null;
+        $this->rawsectionkeys = [];
+        $this->sectionnumberhits = 0;
+        $this->sectionidfallbacks = 0;
+        $this->unmatchedsections = [];
+        $this->walkednumbers = [];
+        $this->delegatedsectioncount = 0;
+        $this->delegatedinlined = 0;
+        $this->delegatednote = '';
+        $this->recoveredcmids = [];
+        $this->insertedcurrent = false;
+        $this->currentinwalk = false;
+        $this->currentfound = false;
+        $this->currentindex = null;
+    }
+
+    /**
+     * Diagnostic description of the automatic neighbour, ignoring the checkbox and custom URL.
+     *
+     * @param cm_info|null $target Automatic neighbour, when one exists.
+     * @param cm_info[] $sequence Display-order modules.
+     * @param int $way -1 for previous, 1 for next.
+     * @return string
+     */
+    private function automatic_summary(?cm_info $target, array $sequence, int $way): string {
+        if ($target !== null && $this->activity_url($target) !== null) {
+            $skipped = $this->skipped_notes($sequence, $this->currentindex, $way, $target);
+            $extra = $skipped === '' ? '' : '; ' . $skipped;
+            return 'automatic cmid ' . (int)$target->id . ' modname ' . $target->modname . $extra;
+        }
+        $reason = $target === null
+            ? $this->omit_reason($sequence, $this->currentindex, $way)
+            : 'no url' . $this->url_type_suffix($target);
+        return 'automatic omitted: ' . $reason;
+    }
+
+    /**
+     * Exact reason there is no automatic neighbour in one direction.
+     *
+     * The phrase is "no neighbour" when nothing sits on that side, otherwise the
+     * nearest module's reason: "not uservisible", "no url", or "skipped non-navigable".
+     *
+     * @param cm_info[] $sequence Display-order modules.
+     * @param int|null $index Index of the current activity.
+     * @param int $direction -1 for previous, 1 for next.
+     * @return string
+     */
+    private function omit_reason(array $sequence, ?int $index, int $direction): string {
+        if ($index === null) {
+            if ($sequence === []) {
+                return 'no neighbour (sequence empty)';
+            }
+            return 'no neighbour (current cmid not in sequence)';
+        }
+
+        $skip = $this->config_flag('skipnonnavigable', true);
+        $count = count($sequence);
+        $reasons = [];
+        $more = false;
+        for ($i = $index + $direction; $i >= 0 && $i < $count; $i += $direction) {
+            $cm = $sequence[$i];
+            $block = $this->navigable_block($cm, $skip);
+            if ($block === null) {
+                return 'cmid ' . (int)$cm->id . ' modname ' . $cm->modname;
+            }
+            if (count($reasons) >= 8) {
+                $more = true;
+                break;
+            }
+            $nearest = $reasons === [] ? 'nearest ' : '';
+            $reasons[] = $block . ' (' . $nearest . 'cmid ' . (int)$cm->id . ' modname ' . $cm->modname . ')';
+        }
+        if ($reasons === []) {
+            return 'no neighbour';
+        }
+        $text = implode('; ', $reasons);
+        if ($more) {
+            $text .= '; and more';
+        }
+        return $text;
+    }
+
+    /**
+     * Modules skipped between the current activity and the chosen neighbour.
+     *
+     * @param cm_info[] $sequence Display-order modules.
+     * @param int|null $index Index of the current activity.
+     * @param int $direction -1 for previous, 1 for next.
+     * @param cm_info $target Chosen neighbour.
+     * @return string
+     */
+    private function skipped_notes(array $sequence, ?int $index, int $direction, cm_info $target): string {
+        if ($index === null) {
+            return '';
+        }
+        $skip = $this->config_flag('skipnonnavigable', true);
+        $notes = [];
+        $count = count($sequence);
+        for ($i = $index + $direction; $i >= 0 && $i < $count; $i += $direction) {
+            $cm = $sequence[$i];
+            if ((int)$cm->id === (int)$target->id) {
+                break;
+            }
+            $block = $this->navigable_block($cm, $skip);
+            if ($block === null) {
+                $block = 'skipped';
+            }
+            $notes[] = $block . ' (cmid ' . (int)$cm->id . ' modname ' . $cm->modname . ')';
+            if (count($notes) >= 8) {
+                break;
+            }
+        }
+        return implode('; ', $notes);
+    }
+
+    /**
+     * Plain-text diagnostic for the button bar.
+     *
+     * The template escapes this string. It is not written to the error log.
+     *
+     * @param course_modinfo $modinfo Course module cache.
+     * @param cm_info[] $sequence Display-order modules.
+     * @param string $previoussummary Previous line, including cmid or the omit reason.
+     * @param string $nextsummary Next line, including cmid or the omit reason.
+     * @return string
+     */
+    private function debug_text(
+        course_modinfo $modinfo,
+        array $sequence,
+        string $previoussummary,
+        string $nextsummary
+    ): string {
+        global $PAGE;
+
+        $cm = $PAGE->cm;
+        try {
+            $cm = $modinfo->get_cm((int)$PAGE->cm->id);
+        } catch (moodle_exception) {
+            $cm = $PAGE->cm;
+        }
+
+        $grouped = $this->grouped_sections($modinfo);
+        $sectionnum = (int)$cm->sectionnum;
+        $sectionid = (int)$cm->section;
+        $installed = get_config(self::COMPONENT, 'version');
+        $inserted = !$this->currentinwalk && ($this->insertedcurrent || $this->current_was_recovered());
+        $counts = $this->other_reason_counts($sequence);
+
+        $lines = [
+            'plugin version: ' . self::VERSION,
+            'installed version: ' . ($installed === false ? 'not saved' : (string)$installed),
+            'pagetype: ' . (string)$PAGE->pagetype,
+            'cmid: ' . (int)$cm->id,
+            'modname: ' . (string)$cm->modname,
+            'cm sectionnum: ' . $sectionnum,
+            'cm section id: ' . $sectionid,
+            'sectionnum key present: ' . (array_key_exists($sectionnum, $grouped) ? 'yes' : 'no'),
+            'section id key present: ' . (array_key_exists($sectionid, $grouped) ? 'yes' : 'no'),
+            'modinfo cms: ' . count($modinfo->get_cms()),
+            'sequence count: ' . count($sequence),
+            'current found: ' . ($this->currentfound ? 'yes' : 'no'),
+            'current index: ' . ($this->currentindex === null ? 'none' : (string)$this->currentindex),
+            'current in section walk: ' . ($this->currentinwalk ? 'yes' : 'no'),
+            'current inserted: ' . ($inserted ? 'yes' : 'no'),
+            'get_sections keys: ' . $this->number_list($this->rawsectionkeys),
+            'section numbers walked: ' . $this->number_list($this->walkednumbers),
+            'section-number hits: ' . $this->sectionnumberhits,
+            'section-id fallbacks: ' . $this->sectionidfallbacks,
+            'sections with no cm ids: ' . $this->number_list($this->unmatchedsections),
+            'delegated sections: ' . $this->delegatedsectioncount,
+            'delegated inlined: ' . $this->delegatedinlined,
+            'delegated map: ' . ($this->delegatednote === '' ? 'none' : $this->delegatednote),
+            'cms recovered: ' . $this->number_list($this->recoveredcmids),
+            'showprevious: ' . $this->flag_status('showprevious', true),
+            'shownext: ' . $this->flag_status('shownext', true),
+            'previousurl: ' . $this->url_status('previousurl'),
+            'nexturl: ' . $this->url_status('nexturl'),
+            'skipnonnavigable: ' . $this->flag_status('skipnonnavigable', true),
+            'other cms: ' . $counts['other'],
+            'other navigable: ' . $counts['navigable'],
+            'other not uservisible: ' . $counts['not uservisible'],
+            'other no url: ' . $counts['no url'],
+            'other skipped non-navigable: ' . $counts['skipped non-navigable'],
+            'other deletion in progress: ' . $counts['deletion in progress'],
+            'sequence around current: ' . $this->sequence_window($sequence, $this->currentindex),
+            $previoussummary,
+            $nextsummary,
+        ];
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Whether recovery inserted the current course module.
+     *
+     * @return bool
+     */
+    private function current_was_recovered(): bool {
+        global $PAGE;
+
+        return in_array((int)$PAGE->cm->id, $this->recoveredcmids, true);
+    }
+
+    /**
+     * Counts of why other modules in the sequence cannot be linked.
+     *
+     * @param cm_info[] $sequence Display-order modules.
+     * @return array<string, int>
+     */
+    private function other_reason_counts(array $sequence): array {
+        $skip = $this->config_flag('skipnonnavigable', true);
+        $counts = [
+            'other' => 0,
+            'navigable' => 0,
+            'not uservisible' => 0,
+            'no url' => 0,
+            'skipped non-navigable' => 0,
+            'deletion in progress' => 0,
+        ];
+        foreach ($sequence as $position => $cm) {
+            if ($this->currentindex !== null && $position === $this->currentindex) {
+                continue;
+            }
+            $counts['other']++;
+            $reason = $this->navigable_block($cm, $skip);
+            if ($reason === null) {
+                $counts['navigable']++;
+                continue;
+            }
+            foreach (['deletion in progress', 'not uservisible', 'no url', 'skipped non-navigable'] as $bucket) {
+                if ($reason === $bucket || str_starts_with($reason, $bucket . ' ') || str_starts_with($reason, $bucket . '(')) {
+                    $counts[$bucket]++;
+                    break;
+                }
+            }
+        }
+        return $counts;
+    }
+
+    /**
+     * A short slice of the sequence, with the current module in brackets.
+     *
+     * @param cm_info[] $sequence Display-order modules.
+     * @param int|null $index Index of the current activity.
+     * @return string
+     */
+    private function sequence_window(array $sequence, ?int $index): string {
+        $count = count($sequence);
+        if ($count === 0) {
+            return '(empty)';
+        }
+
+        $tokens = [];
+        $append = function (int $i) use ($sequence, $index, &$tokens): void {
+            $cm = $sequence[$i];
+            $token = (int)$cm->id . ':' . $cm->modname;
+            if ($index !== null && $i === $index) {
+                $token = '[' . $token . ']';
+            }
+            $tokens[] = $token;
+        };
+
+        if ($index === null && $count > 10) {
+            for ($i = 0; $i < 5; $i++) {
+                $append($i);
+            }
+            $tokens[] = '...';
+            for ($i = $count - 5; $i < $count; $i++) {
+                $append($i);
+            }
+            return implode(', ', $tokens);
+        }
+
+        $start = 0;
+        $end = $count - 1;
+        if ($index !== null) {
+            $start = max(0, $index - 5);
+            $end = min($count - 1, $index + 5);
+        } else {
+            $end = min($end, 9);
+        }
+        if ($start > 0) {
+            $tokens[] = '...';
+        }
+        for ($i = $start; $i <= $end; $i++) {
+            $append($i);
+        }
+        if ($end < $count - 1) {
+            $tokens[] = '...';
+        }
+        return implode(', ', $tokens);
+    }
+
+    /**
+     * Comma-separated values, capped so a large course stays readable.
+     *
+     * @param array $numbers Values to list.
+     * @return string
+     */
+    private function number_list(array $numbers): string {
+        if ($numbers === []) {
+            return '(none)';
+        }
+        $shown = array_slice(array_values($numbers), 0, 40);
+        $text = implode(',', array_map(static function ($value): string {
+            return (string)$value;
+        }, $shown));
+        $extra = count($numbers) - count($shown);
+        if ($extra > 0) {
+            $text .= ' +' . $extra . ' more';
+        }
+        return $text;
+    }
+
+    /**
+     * Checkbox value as stored, so a saved "0" is visible beside the default.
+     *
+     * @param string $setting Config name.
+     * @param bool $default Value used when the setting has never been saved.
+     * @return string
+     */
+    private function flag_status(string $setting, bool $default): string {
+        $value = get_config(self::COMPONENT, $setting);
+        if ($value === false) {
+            return 'not saved, default ' . ($default ? 'on' : 'off');
+        }
+        $text = trim((string)$value);
+        $on = $text === '1';
+        return 'saved "' . $this->one_line($text, 40) . '" (' . ($on ? 'on' : 'off') . ')';
+    }
+
+    /**
+     * Whether a custom URL is empty, valid, or rejected.
+     *
+     * @param string $setting Config name.
+     * @return string
+     */
+    private function url_status(string $setting): string {
+        $value = $this->config_text($setting);
+        if ($value === '') {
+            return 'empty';
+        }
+        if (self::clean_link($value) === null) {
+            return 'invalid (' . $this->one_line($value, 120) . ')';
+        }
+        return 'valid';
+    }
+
+    /**
+     * Single-line, length-capped text for the diagnostic.
+     *
+     * @param string $value Raw text.
+     * @param int $limit Maximum characters before an ellipsis.
+     * @return string
+     */
+    private function one_line(string $value, int $limit = 80): string {
+        $value = preg_replace('/\s+/', ' ', $value);
+        if (!is_string($value)) {
+            return '';
+        }
+        if (strlen($value) > $limit) {
+            return substr($value, 0, $limit) . '...';
+        }
+        return $value;
     }
 }

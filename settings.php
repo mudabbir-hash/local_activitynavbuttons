@@ -47,6 +47,12 @@ if ($hassiteconfig) {
             get_string('enabled_desc', 'local_activitynavbuttons'),
             1
         ));
+        $settings->add(new admin_setting_configcheckbox(
+            'local_activitynavbuttons/debug',
+            get_string('debug', 'local_activitynavbuttons'),
+            get_string('debug_desc', 'local_activitynavbuttons'),
+            1
+        ));
 
         $settings->add(new admin_setting_configcheckbox(
             'local_activitynavbuttons/showprevious',

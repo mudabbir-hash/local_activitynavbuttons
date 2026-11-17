@@ -24,6 +24,7 @@
     * previous - Optional link object.
     * next - Optional link object.
     * backtocourse - Optional link object.
+    * debugtext - Optional plain-text diagnostic. Escaped by the template. Shown when the debug setting is on, or when Previous or Next is missing.
 
     Each link object:
     * url - Destination href.
@@ -86,4 +87,7 @@
             </a>
         {{/next}}
     </div>
+    {{#debugtext}}
+    <div class="local-activitynavbuttons-debug">{{debugtext}}</div>
+    {{/debugtext}}
 </nav>

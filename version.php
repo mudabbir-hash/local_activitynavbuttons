@@ -25,7 +25,10 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'local_activitynavbuttons';
-$plugin->version = 2026111702;
+// Sequence fix: cm ids come from get_sections() by section number, every non-deleted
+// cm stays in the list, and delegated subsections are inlined after the owning cm.
+// Keep in step with local_activitynavbuttons\local\navigation::VERSION.
+$plugin->version = 2026111703;
 $plugin->requires = 2024100700;
 $plugin->maturity = MATURITY_STABLE;
 $plugin->release = '1.0.0';
