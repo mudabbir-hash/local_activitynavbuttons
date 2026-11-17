@@ -25,10 +25,12 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'local_activitynavbuttons';
-// Sequence fix: cm ids come from get_sections() by section number, every non-deleted
-// cm stays in the list, and delegated subsections are inlined after the owning cm.
+// Activity pages render the diagnostic whenever debug is on, including when
+// every button is omitted. Neighbours come from get_cms(), and a section walk
+// is used only when it keeps those course modules. get_sections() is read by
+// section number, never by the section id in $cm->section.
 // Keep in step with local_activitynavbuttons\local\navigation::VERSION.
-$plugin->version = 2026111703;
+$plugin->version = 2026111704;
 $plugin->requires = 2024100700;
 $plugin->maturity = MATURITY_STABLE;
 $plugin->release = '1.0.0';

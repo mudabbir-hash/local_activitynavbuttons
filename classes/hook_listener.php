@@ -51,27 +51,77 @@ class hook_listener {
             return;
         }
 
-        $data = (new navigation_builder())->build();
-        if ($data === null) {
-            return;
-        }
+        try {
+            $data = (new navigation_builder())->build();
+            if ($data === null) {
+                return;
+            }
 
-        $navigation = new navigation_output($data);
-        $html = $hook->renderer->render($navigation);
-        if (!is_string($html) || $html === '') {
+            $navigation = new navigation_output($data);
+            $html = '';
+            try {
+                $html = $hook->renderer->render($navigation);
+            } catch (\Throwable $e) {
+                $html = '';
+            }
             // The page renderer looks for render_navigation() before the
             // Mustache template. A theme method of that name can return an
-            // empty string for this widget. Render the plugin template from
-            // the exported context so the bar is still injected.
-            $html = $hook->renderer->render_from_template(
-                'local_activitynavbuttons/navigation',
-                $navigation->export_for_template($hook->renderer)
-            );
+            // empty string, or the navigation block, for this widget. Render
+            // the plugin template when the result is not our bar.
+            if (!is_string($html) || !str_contains($html, 'local-activitynavbuttons')) {
+                $html = $hook->renderer->render_from_template(
+                    'local_activitynavbuttons/navigation',
+                    $navigation->export_for_template($hook->renderer)
+                );
+            }
+            if (!is_string($html) || !str_contains($html, 'local-activitynavbuttons')) {
+                $hook->add_html(self::failure_markup(null));
+                return;
+            }
+            $hook->add_html(self::styles_markup() . $html);
+        } catch (\Throwable $e) {
+            $fallback = self::failure_markup($e);
+            if ($fallback !== '') {
+                $hook->add_html($fallback);
+            }
         }
-        if (!is_string($html) || $html === '') {
-            return;
+    }
+
+    /**
+     * Diagnostic nav used when rendering the bar throws.
+     *
+     * Shown on an activity page when the debug setting is on or has never been
+     * saved. The text is escaped. Nothing is written to the error log.
+     *
+     * @param \Throwable|null $e Failure, when one was caught.
+     * @return string
+     */
+    private static function failure_markup(?\Throwable $e): string {
+        global $PAGE;
+
+        if (empty($PAGE->cm) || empty($PAGE->cm->id)) {
+            return '';
         }
-        $hook->add_html(self::styles_markup() . $html);
+        $debug = get_config(navigation_builder::COMPONENT, 'debug');
+        if ($debug !== false && trim((string)$debug) !== '1') {
+            return '';
+        }
+
+        $lines = [
+            'plugin version: ' . navigation_builder::VERSION,
+            'pagetype: ' . (string)$PAGE->pagetype,
+            'cmid: ' . (int)$PAGE->cm->id,
+            'sequence count: unknown',
+            'current index: unknown',
+        ];
+        if ($e !== null) {
+            $lines[] = 'render failed: ' . $e->getMessage();
+        } else {
+            $lines[] = 'render failed: template produced no activity navigation markup';
+        }
+        $text = htmlspecialchars(implode("\n", $lines), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        return '<nav class="local-activitynavbuttons" role="navigation">'
+            . '<div class="local-activitynavbuttons-debug">' . $text . '</div></nav>';
     }
 
     /**
