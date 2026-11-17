@@ -26,16 +26,24 @@
  * 1. Walk non-delegated sections in get_section_info_all() order.
  * 2. Within a section, follow get_sections() (section number => cmids in
  *    sequence). That is the modinfo cache, not a fresh database query.
- * 3. When a course module owns a delegated section, get_section_info_by_component('mod_' . modname, instance)
- *    finds it in the same cache. The module is considered in place, then the
- *    delegated section is inserted there, including nested subsections.
- * 4. Delegated sections that were not reached from a parent module are appended
+ * 3. Those top-level modules are recorded before any delegated section is
+ *    entered. A subsection lookup only inserts children after the owning
+ *    module. If that lookup fails, the top-level modules stay where they are.
+ * 4. When a module owns a delegated section and has a URL, the module is kept
+ *    and the subsection modules follow it, including nested subsections.
+ *    A module with no URL is not itself a target; its subsection modules are
+ *    still inserted at that point.
+ * 5. Delegated sections that were not reached from a parent module are appended
  *    in get_section_info_all() order so an orphaned subsection is not dropped.
+ *
+ * The current activity is always kept in that list, even when it would not be
+ * a link target. Neighbours are chosen from the list afterwards. They are not
+ * discovered by the delegated-section walk.
  *
  * Visibility. A link target must be uservisible. Modinfo already applies
  * availability, group, and hidden-section rules for the current user, including
  * guests and users without access. Activities with deletioninprogress are not
- * targets. The current activity is kept as an anchor even when it would not
+ * targets. The current activity stays in the list even when it would not
  * itself be a target, so the nearest earlier and later targets can still be found.
  *
  * Custom URL versus automatic. A non-empty custom URL replaces automatic
@@ -265,9 +273,12 @@ class navigation {
     /**
      * Course modules in on-screen order.
      *
-     * The list includes modules that are not link targets so the current
-     * activity can still be located. Deletion-in-progress modules are left out
-     * except the current one, which remains an anchor.
+     * Non-delegated sections are copied from get_sections() before any
+     * subsection is entered. The current activity is kept even when it is not
+     * a link target, so neighbours() can look on either side of it. A
+     * delegated-section lookup only inserts children after the owning module.
+     * It is not how the current module or its neighbours are found: if the
+     * lookup fails, the top-level modules are already in the list.
      *
      * @param course_modinfo $modinfo Course module cache for the current user.
      * @return cm_info[]
@@ -277,72 +288,406 @@ class navigation {
 
         $sequence = [];
         $seen = [];
-        $visitedsections = [];
+        $inlined = [];
         $currentid = (int)$PAGE->cm->id;
-        $sections = $modinfo->get_section_info_all();
+        $cms = $modinfo->get_cms();
+        $bysection = $modinfo->get_sections();
+        // Indexed by course-module id. Empty when the lookup itself fails, so
+        // a broken subsection delegate cannot remove the activities around it.
+        $delegatedbycm = $this->delegated_sections_by_cm($modinfo);
 
-        foreach ($sections as $section) {
-            if ($section->is_delegated()) {
+        foreach ($modinfo->get_section_info_all() as $sectionnum => $section) {
+            if ($this->section_is_delegated($section)) {
                 continue;
             }
-            $this->append_section($modinfo, $section, $currentid, $sequence, $seen, $visitedsections);
+            $sectionnum = $this->resolved_section_number((int)$sectionnum, $section, $bysection);
+            try {
+                $this->append_section_modules(
+                    $sectionnum,
+                    $currentid,
+                    $cms,
+                    $bysection,
+                    $delegatedbycm,
+                    $sequence,
+                    $seen,
+                    $inlined
+                );
+            } catch (\Throwable) {
+                // Modules already copied stay. Later sections are still walked.
+            }
         }
-        foreach ($sections as $section) {
-            if (!$section->is_delegated() || isset($visitedsections[(int)$section->section])) {
+        foreach ($modinfo->get_section_info_all() as $sectionnum => $section) {
+            if (!$this->section_is_delegated($section)) {
                 continue;
             }
-            $this->append_section($modinfo, $section, $currentid, $sequence, $seen, $visitedsections);
+            $sectionnum = $this->resolved_section_number((int)$sectionnum, $section, $bysection);
+            if (isset($inlined[$sectionnum])) {
+                continue;
+            }
+            try {
+                $this->append_section_modules(
+                    $sectionnum,
+                    $currentid,
+                    $cms,
+                    $bysection,
+                    $delegatedbycm,
+                    $sequence,
+                    $seen,
+                    $inlined
+                );
+            } catch (\Throwable) {
+                // Orphan subsections are optional. Top-level modules are already recorded.
+            }
         }
 
+        $this->ensure_current_anchor($currentid, $cms, $bysection, $sequence, $seen);
         return $sequence;
     }
 
     /**
-     * Append one section's modules, inlining any delegated subsection at the owning module.
+     * Append one section's modules.
      *
-     * @param course_modinfo $modinfo Course module cache.
-     * @param section_info $section Section to walk.
+     * Top-level modules are appended before the method follows a delegated
+     * subsection, so a failed follow-up cannot drop them. A module that owns a
+     * subsection is included when it has a URL (or when it is the current
+     * activity); its subsection modules come next.
+     *
+     * @param int $sectionnum Section number (not the section id).
      * @param int $currentid Current course-module id.
+     * @param cm_info[] $cms Course modules keyed by id.
+     * @param array<int, int[]> $bysection Section number => cmids in sequence order.
+     * @param array<int, section_info> $delegatedbycm Delegated sections keyed by owning cmid.
      * @param cm_info[] $sequence Collected modules.
-     * @param array<int, bool> $seen Course-module ids already collected.
-     * @param array<int, bool> $visitedsections Section numbers already walked.
+     * @param array<int, bool> $seen Course-module ids already considered.
+     * @param array<int, bool> $inlined Section numbers already walked.
      * @return void
      */
-    private function append_section(
-        course_modinfo $modinfo,
-        section_info $section,
+    private function append_section_modules(
+        int $sectionnum,
         int $currentid,
+        array $cms,
+        array $bysection,
+        array $delegatedbycm,
         array &$sequence,
         array &$seen,
-        array &$visitedsections
+        array &$inlined
     ): void {
-        $sectionnum = (int)$section->section;
-        if (isset($visitedsections[$sectionnum])) {
+        if (isset($inlined[$sectionnum])) {
             return;
         }
-        $visitedsections[$sectionnum] = true;
+        $inlined[$sectionnum] = true;
 
-        $sections = $modinfo->get_sections();
-        $cmids = $sections[$sectionnum] ?? [];
-        $cms = $modinfo->get_cms();
-
+        $cmids = $this->section_cmids($bysection, $sectionnum);
         foreach ($cmids as $cmid) {
-            $cmid = (int)$cmid;
             if (isset($seen[$cmid]) || !isset($cms[$cmid])) {
                 continue;
             }
-            $seen[$cmid] = true;
             $cm = $cms[$cmid];
-
-            if (empty($cm->deletioninprogress) || $cmid === $currentid) {
+            $owned = $this->owned_delegated_section($delegatedbycm, $cmid);
+            $seen[$cmid] = true;
+            if ($this->keep_module($cm, $cmid === $currentid, $owned)) {
                 $sequence[] = $cm;
             }
-
-            $delegated = $modinfo->get_section_info_by_component('mod_' . $cm->modname, (int)$cm->instance);
-            if ($delegated instanceof section_info) {
-                $this->append_section($modinfo, $delegated, $currentid, $sequence, $seen, $visitedsections);
+            if (!$owned instanceof section_info) {
+                continue;
+            }
+            $childnum = $this->section_number($owned);
+            if ($childnum === null || isset($inlined[$childnum])) {
+                continue;
+            }
+            try {
+                $this->append_section_modules(
+                    $childnum,
+                    $currentid,
+                    $cms,
+                    $bysection,
+                    $delegatedbycm,
+                    $sequence,
+                    $seen,
+                    $inlined
+                );
+            } catch (\Throwable) {
+                // The parent modules are already recorded. Leave this section
+                // unmarked so the orphan pass can still append its modules.
+                unset($inlined[$childnum]);
             }
         }
+    }
+
+    /**
+     * Course-module ids for a section number, in sequence order.
+     *
+     * get_sections() is keyed by section number. A numeric string key is the
+     * same entry. An empty result is an empty section, not a reason to drop
+     * other sections.
+     *
+     * @param array<int, int[]> $bysection Section number => cmids.
+     * @param int $sectionnum Section number.
+     * @return int[]
+     */
+    private function section_cmids(array $bysection, int $sectionnum): array {
+        $cmids = $bysection[$sectionnum] ?? [];
+        if (!is_array($cmids)) {
+            return [];
+        }
+        $ids = [];
+        foreach ($cmids as $cmid) {
+            $ids[] = (int)$cmid;
+        }
+        return $ids;
+    }
+
+    /**
+     * Whether this section is delegated to a component.
+     *
+     * A failure here is treated as not delegated, so the section's own modules
+     * stay in the top-level pass instead of being skipped.
+     *
+     * @param section_info $section Section from get_section_info_all().
+     * @return bool
+     */
+    private function section_is_delegated(section_info $section): bool {
+        if (!method_exists($section, 'is_delegated')) {
+            return false;
+        }
+        try {
+            return (bool)$section->is_delegated();
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * Delegated sections keyed by the course-module that owns them.
+     *
+     * This is get_sections_delegated_by_cm(), keyed by course-module id.
+     * Looking up get_section_info_by_component('mod_' . modname, instance) for
+     * every module, then walking that section with the same visited-section
+     * guard as top-level sections, could mark a section visited and skip its
+     * modules. An empty map only skips inlining. Top-level modules are already
+     * recorded by the caller.
+     *
+     * @param course_modinfo $modinfo Course module cache.
+     * @return array<int, section_info>
+     */
+    private function delegated_sections_by_cm(course_modinfo $modinfo): array {
+        if (!method_exists($modinfo, 'get_sections_delegated_by_cm')) {
+            return [];
+        }
+        try {
+            $map = $modinfo->get_sections_delegated_by_cm();
+        } catch (\Throwable) {
+            return [];
+        }
+        return is_array($map) ? $map : [];
+    }
+
+    /**
+     * Delegated section owned by this course module, if any.
+     *
+     * @param array<int, section_info> $delegatedbycm Map from delegated_sections_by_cm().
+     * @param int $cmid Course-module id.
+     * @return section_info|null
+     */
+    private function owned_delegated_section(array $delegatedbycm, int $cmid): ?section_info {
+        if (!isset($delegatedbycm[$cmid]) || !$delegatedbycm[$cmid] instanceof section_info) {
+            return null;
+        }
+        $section = $delegatedbycm[$cmid];
+        if (!$this->section_is_delegated($section)) {
+            return null;
+        }
+        return $section;
+    }
+
+    /**
+     * Section number to use with get_sections().
+     *
+     * get_section_info_all() is keyed by section number. When that key has no
+     * modules and the section's own number does, the property is used. An
+     * empty section stays empty; other sections are unaffected.
+     *
+     * @param int $key Key from get_section_info_all().
+     * @param section_info $section Section at that key.
+     * @param array<int, int[]> $bysection Section number => cmids.
+     * @return int
+     */
+    private function resolved_section_number(int $key, section_info $section, array $bysection): int {
+        if ($this->section_cmids($bysection, $key) !== []) {
+            return $key;
+        }
+        $fromproperty = $this->section_number($section);
+        if ($fromproperty !== null && $fromproperty !== $key && $this->section_cmids($bysection, $fromproperty) !== []) {
+            return $fromproperty;
+        }
+        return $key;
+    }
+
+    /**
+     * Section number for a section_info, or null when it cannot be read.
+     *
+     * @param section_info $section Section to read.
+     * @return int|null
+     */
+    private function section_number(section_info $section): ?int {
+        try {
+            return (int)$section->section;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether this module belongs in the display sequence.
+     *
+     * The current activity is always kept, including when it is not uservisible
+     * or has no URL, so it can anchor the previous and next search. Other
+     * modules being deleted are left out. A module that owns a subsection is
+     * kept when it has a URL; without one it is only a container, and the
+     * subsection modules are still added by the caller.
+     *
+     * @param cm_info $cm Candidate module.
+     * @param bool $iscurrent True when this is the activity being viewed.
+     * @param section_info|null $owned Delegated section owned by this module.
+     * @return bool
+     */
+    private function keep_module(cm_info $cm, bool $iscurrent, ?section_info $owned): bool {
+        if ($iscurrent) {
+            return true;
+        }
+        if (!empty($cm->deletioninprogress)) {
+            return false;
+        }
+        if ($owned instanceof section_info && !$this->has_link_url($cm)) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether the module has a view URL a button could open.
+     *
+     * This is not the full navigable check. Availability and the skip setting
+     * are applied later, when a neighbour is chosen.
+     *
+     * @param cm_info $cm Candidate module.
+     * @return bool
+     */
+    private function has_link_url(cm_info $cm): bool {
+        try {
+            return $cm->url instanceof moodle_url;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * Put the current activity into the sequence when the section walk missed it.
+     *
+     * get_sections() is the course order for modules the cache lists. The
+     * activity open in the browser can be absent from that list, or it can
+     * fail every link-target check, and the previous and next modules are
+     * still on either side. Neighbour search needs this anchor. Placement
+     * follows the section sequence when the cmid is there, otherwise the
+     * section number.
+     *
+     * @param int $currentid Current course-module id.
+     * @param cm_info[] $cms Course modules keyed by id.
+     * @param array<int, int[]> $bysection Section number => cmids.
+     * @param cm_info[] $sequence Collected modules.
+     * @param array<int, bool> $seen Course-module ids already considered.
+     * @return void
+     */
+    private function ensure_current_anchor(
+        int $currentid,
+        array $cms,
+        array $bysection,
+        array &$sequence,
+        array &$seen
+    ): void {
+        // Seen is not enough: a container module can be considered and left out
+        // of the list. The anchor is the current id actually present in it.
+        if ($this->sequence_index($sequence, $currentid) !== null) {
+            $seen[$currentid] = true;
+            return;
+        }
+        $cm = $cms[$currentid] ?? null;
+        if (!$cm instanceof cm_info) {
+            global $PAGE;
+            if (($PAGE->cm instanceof cm_info) && (int)$PAGE->cm->id === $currentid) {
+                $cm = $PAGE->cm;
+            } else {
+                return;
+            }
+        }
+
+        $sectionnum = null;
+        try {
+            $sectionnum = (int)$cm->sectionnum;
+        } catch (\Throwable) {
+            $sectionnum = null;
+        }
+
+        $insertat = $this->anchor_index($sequence, $bysection, $currentid, $sectionnum);
+        array_splice($sequence, $insertat, 0, [$cm]);
+        $seen[$currentid] = true;
+    }
+
+    /**
+     * Index at which the current activity should be inserted.
+     *
+     * @param cm_info[] $sequence Modules already collected.
+     * @param array<int, int[]> $bysection Section number => cmids.
+     * @param int $currentid Current course-module id.
+     * @param int|null $sectionnum Section number of the current activity.
+     * @return int
+     */
+    private function anchor_index(array $sequence, array $bysection, int $currentid, ?int $sectionnum): int {
+        if ($sectionnum !== null) {
+            $cmids = $this->section_cmids($bysection, $sectionnum);
+            $pos = array_search($currentid, $cmids, true);
+            if ($pos !== false) {
+                for ($i = $pos - 1; $i >= 0; $i--) {
+                    $idx = $this->sequence_index($sequence, $cmids[$i]);
+                    if ($idx !== null) {
+                        return $idx + 1;
+                    }
+                }
+                for ($i = $pos + 1, $count = count($cmids); $i < $count; $i++) {
+                    $idx = $this->sequence_index($sequence, $cmids[$i]);
+                    if ($idx !== null) {
+                        return $idx;
+                    }
+                }
+            }
+            foreach ($sequence as $i => $existing) {
+                try {
+                    $existingnum = (int)$existing->sectionnum;
+                } catch (\Throwable) {
+                    continue;
+                }
+                if ($existingnum > $sectionnum) {
+                    return $i;
+                }
+            }
+        }
+        return count($sequence);
+    }
+
+    /**
+     * Position of a course module in the sequence, or null when it is absent.
+     *
+     * @param cm_info[] $sequence Collected modules.
+     * @param int $cmid Course-module id.
+     * @return int|null
+     */
+    private function sequence_index(array $sequence, int $cmid): ?int {
+        foreach ($sequence as $i => $existing) {
+            if ((int)$existing->id === $cmid) {
+                return $i;
+            }
+        }
+        return null;
     }
 
     /**
