@@ -23,8 +23,8 @@
     * navigationlabel - Accessible name for the navigation landmark.
     * previous - Optional link object.
     * next - Optional link object.
-    * backtocourse - Optional link object.
-    * debugtext - Optional plain-text diagnostic. Escaped by the template. Shown when the debug setting is on, or when Previous or Next is missing.
+    * backtocourse - Optional link object. When present, debugtext on this same object is rendered beside the link.
+    * debugtext - Plain-text diagnostic. Escaped by the template. Always set for this release, including when the debug setting is off. Printed in the course slot, in the same section as Back to course.
 
     Each link object:
     * url - Destination href.
@@ -32,6 +32,7 @@
     * arialabel - Accessible name, including the activity name when it is known.
     * classes - Button classes.
     * newtab - When true, target="_blank" and rel="noopener noreferrer".
+    * debugtext - On backtocourse only. The diagnostic printed beside that button.
 
     Example context (json):
     {
@@ -48,8 +49,10 @@
             "text": "Back to course",
             "arialabel": "Back to course",
             "classes": "btn btn-outline-primary",
-            "newtab": false
+            "newtab": false,
+            "debugtext": "plugin version: 2026111705\npagetype: mod-page-view\ncmid: 4\nmodname: page\nsequence count: 3\ncurrent found: yes\nprevious: id 2 name Introduction\nnext: id 3 name Summary\nshowprevious: saved \"1\" (on)\nshownext: saved \"1\" (on)\npreviousurl: empty\nnexturl: empty"
         },
+        "debugtext": "plugin version: 2026111705",
         "next": {
             "url": "https://example.com/mod/page/view.php?id=3&forceview=1",
             "text": "Next: Summary",
@@ -75,6 +78,10 @@
             <a class="{{classes}}" href="{{url}}" aria-label="{{arialabel}}"{{#newtab}} target="_blank" rel="noopener noreferrer"{{/newtab}}>
                 <span>{{text}}</span>
             </a>
+            <div class="local-activitynavbuttons-debug">{{debugtext}}</div>
+        {{/backtocourse}}
+        {{^backtocourse}}
+            <div class="local-activitynavbuttons-debug">{{debugtext}}</div>
         {{/backtocourse}}
     </div>
     <div class="local-activitynavbuttons-slot local-activitynavbuttons-next">
@@ -87,7 +94,4 @@
             </a>
         {{/next}}
     </div>
-    {{#debugtext}}
-    <div class="local-activitynavbuttons-debug">{{debugtext}}</div>
-    {{/debugtext}}
 </nav>

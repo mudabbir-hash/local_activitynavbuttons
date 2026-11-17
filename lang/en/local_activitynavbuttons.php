@@ -34,7 +34,7 @@ $string['enabled'] = 'Enable activity navigation buttons';
 $string['enabled_desc'] = 'When this is off, activity pages do not show the button bar.';
 
 $string['debug'] = 'Show navigation debug';
-$string['debug_desc'] = 'Show a plain-text box inside the button bar with the plugin version, this page, the activity sequence, and why Previous and Next are shown or hidden. On for this release. The box also appears when a Previous or Next button is missing.';
+$string['debug_desc'] = 'Show a plain-text box beside Back to course with the plugin version, this page, the activity sequence, and why Previous and Next are shown or hidden. For this release the box is shown in that bar even when this setting is off.';
 
 $string['showprevious'] = 'Show previous button';
 $string['showprevious_desc'] = 'Show a button for the previous activity, or for the custom previous URL.';

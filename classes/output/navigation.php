@@ -53,10 +53,24 @@ class navigation implements \renderable, \templatable {
     /**
      * Export data for the navigation template.
      *
+     * Back to course and its diagnostic travel on one object. The template
+     * prints that text in the same section as the link, so a missing debug
+     * flag cannot drop the box while the button stays.
+     *
      * @param renderer_base $output Renderer (unused; strings are already prepared).
      * @return stdClass
      */
     public function export_for_template(renderer_base $output): stdClass {
-        return $this->data;
+        $data = $this->data;
+        if (!isset($data->debugtext) || !is_string($data->debugtext) || $data->debugtext === '') {
+            $data->debugtext = 'plugin version: ' . \local_activitynavbuttons\local\navigation::VERSION;
+        }
+        if (isset($data->backtocourse) && is_object($data->backtocourse)) {
+            if (!isset($data->backtocourse->debugtext) || !is_string($data->backtocourse->debugtext)
+                    || $data->backtocourse->debugtext === '') {
+                $data->backtocourse->debugtext = $data->debugtext;
+            }
+        }
+        return $data;
     }
 }
