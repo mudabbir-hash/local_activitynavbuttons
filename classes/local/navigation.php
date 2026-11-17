@@ -218,27 +218,30 @@ class navigation {
     /**
      * Whether this request is an activity or resource view page.
      *
-     * Requires a module context whose instance is $PAGE->cm, and a pagetype of
-     * mod-*-view. Course pages, the site home, and admin pages use other pagetypes.
+     * Course, site, and admin pages never call $PAGE->set_cm(), so they have no
+     * $PAGE->cm and are excluded. Activity scripts usually get a pagetype of
+     * mod-<modname>-view, but that string is not always exact: a module may
+     * append a suffix or set a longer pagetype, and later code may replace
+     * $PAGE->context after set_cm(). A prefix match is enough when a course
+     * module is present. When the pagetype does not match, a valid cm_info
+     * with a module context is still an activity or resource page.
      *
      * @return bool
      */
     private function is_activity_view(): bool {
         global $PAGE;
 
+        // No course module: course page, site home, or admin.
         if (empty($PAGE->cm) || !($PAGE->cm instanceof cm_info) || empty($PAGE->cm->id)) {
             return false;
         }
-        if (!preg_match('/^mod-[a-z0-9_]+-view$/i', (string)$PAGE->pagetype)) {
-            return false;
+        // mod-<modname>-view, including a suffix after "-view". The old
+        // full-string match (and a required context instance id) missed real
+        // activity and resource view pages, so the bar was never rendered.
+        if (preg_match('/^mod-[a-z0-9_]+-view/i', (string)$PAGE->pagetype)) {
+            return true;
         }
-        if (empty($PAGE->context) || (int)$PAGE->context->contextlevel !== CONTEXT_MODULE) {
-            return false;
-        }
-        if ((int)$PAGE->context->instanceid !== (int)$PAGE->cm->id) {
-            return false;
-        }
-        return true;
+        return !empty($PAGE->context) && (int)$PAGE->context->contextlevel === CONTEXT_MODULE;
     }
 
     /**

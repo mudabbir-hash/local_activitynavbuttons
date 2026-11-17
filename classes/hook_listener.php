@@ -56,8 +56,19 @@ class hook_listener {
             return;
         }
 
-        $html = $hook->renderer->render(new navigation_output($data));
-        if ($html === '') {
+        $navigation = new navigation_output($data);
+        $html = $hook->renderer->render($navigation);
+        if (!is_string($html) || $html === '') {
+            // The page renderer looks for render_navigation() before the
+            // Mustache template. A theme method of that name can return an
+            // empty string for this widget. Render the plugin template from
+            // the exported context so the bar is still injected.
+            $html = $hook->renderer->render_from_template(
+                'local_activitynavbuttons/navigation',
+                $navigation->export_for_template($hook->renderer)
+            );
+        }
+        if (!is_string($html) || $html === '') {
             return;
         }
         $hook->add_html(self::styles_markup() . $html);

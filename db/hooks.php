@@ -27,6 +27,12 @@ defined('MOODLE_INTERNAL') || die();
 $callbacks = [
     [
         'hook' => \core\hook\output\before_footer_html_generation::class,
-        'callback' => \local_activitynavbuttons\hook_listener::class . '::before_footer',
+        // Array callable: hook\manager validates [class, method] and caches it
+        // as class::method. Priority 100 is the manager default (higher runs
+        // first) and is set explicitly. Callbacks stay cached until the plugin
+        // version changes, so version.php is bumped with this registration;
+        // otherwise before_footer never runs and the bar is missing.
+        'callback' => [\local_activitynavbuttons\hook_listener::class, 'before_footer'],
+        'priority' => 100,
     ],
 ];

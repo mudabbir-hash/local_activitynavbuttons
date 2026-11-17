@@ -28,7 +28,6 @@ defined('MOODLE_INTERNAL') || die();
 
 use renderer_base;
 use stdClass;
-use templatable;
 
 /**
  * Template export for local_activitynavbuttons/navigation.
@@ -38,7 +37,7 @@ use templatable;
  * once, and the template encodes the result. Labels are plain text cleaned
  * with PARAM_TEXT. Pre-escaping with s() would double-encode under {{ }}.
  */
-class navigation implements \renderable, templatable {
+class navigation implements \renderable, \templatable {
     /** @var stdClass Template data from the navigation builder. */
     private $data;
 

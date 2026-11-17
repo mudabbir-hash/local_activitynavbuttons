@@ -47,7 +47,7 @@ Until an administrator saves the settings page, unsaved checkboxes use the defau
 
 ## Behaviour
 
-Buttons appear only on an activity or resource view: the page has a course module, the context is that module, and the page type matches `mod-*-view`. Course pages, the site home, and admin pages are left unchanged.
+Buttons appear only on an activity or resource view. The page must have a course module. A page type of `mod-<modname>-view` matches, including a suffix after `-view`. When the page type is different, the bar still shows if the context is a module context. Course pages, the site home, and admin pages have no course module and are left unchanged.
 
 Previous and Next are chosen independently.
 
